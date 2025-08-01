@@ -1,0 +1,161 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  This CloudFormation template provisions an EC2 instance configured to run a vLLM inference service using Docker. 
+  It installs Docker, pulls the vLLM container from a public ECR repository, and launches the Large Language Model (LLM) 
+  with Hugging Face Hub token authentication. The instance is customizable via parameters such as instance type, subnet, 
+  security group, and SSH key pair.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "EC2 Configuration"
+        Parameters:
+          - KeyName
+          # - VpcId
+          - SubnetId
+          - SecurityGroupId
+    ParameterLabels:
+      KeyName:
+        default: "EC2 Key Pair"
+      # VpcId:
+      #   default: "VPC ID"
+      SubnetId:
+        default: "Subnet ID"
+      SecurityGroupId:
+        default: "Security Group ID"
+
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair for SSH access
+    Type: AWS::EC2::KeyPair::KeyName
+
+  # VpcId:
+  #   Description: ID of an existing VPC
+  #   Type: AWS::EC2::VPC::Id
+
+  SubnetId:
+    Description: ID of an existing Subnet
+    Type: AWS::EC2::Subnet::Id
+
+  SecurityGroupId:
+    Description: ID of an existing Security Group
+    Type: AWS::EC2::SecurityGroup::Id
+
+  HFToken:
+    Type: String
+    NoEcho: true
+    Description: Hugging Face Hub Token
+
+  InferenceModel:
+    Type: String
+    Default: Qwen/Qwen2.5-1.5B-Instruct
+    Description: Model name or path to use for inference.
+
+  InstanceType:
+    Description: WebServer EC2 instance type
+    Type: String
+    AllowedValues:
+      - m7i.2xlarge
+      - m7i.4xlarge
+      - m7i.8xlarge
+      - m7i.12xlarge
+      - i7i.2xlarge
+      - i7i.4xlarge
+    Default: m7i.2xlarge
+
+Mappings:
+  RegionMap:
+    us-west-2:
+      AMI: ami-0ec1bf4a8f92e7bd1
+    us-east-1:
+      AMI: ami-0a7d80731ae1b2435
+
+Resources:
+  MyEC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", AMI]
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          SubnetId: !Ref SubnetId
+          GroupSet:
+            - !Ref SecurityGroupId
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1 
+          Ebs:
+            VolumeSize: 32 
+            VolumeType: gp3
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64:
+          !Sub
+            - |
+              #!/bin/bash
+              set -e
+              export DEBIAN_FRONTEND=noninteractive
+
+              apt-get update
+              for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do
+                apt-get remove -y $pkg || true
+              done
+
+              apt-get update
+              apt-get install -y ca-certificates curl gnupg lsb-release
+
+              mkdir -p /etc/apt/keyrings
+              curl -fsSL https://download.docker.com/linux/ubuntu/gpg | tee /etc/apt/keyrings/docker.asc > /dev/null
+              chmod a+r /etc/apt/keyrings/docker.asc
+
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu jammy stable" | tee /etc/apt/sources.list.d/docker.list
+
+              apt-get update
+              apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+              systemctl start docker
+              systemctl enable docker
+
+              # Wait for Docker daemon to be ready
+              for i in {1..30}; do
+                if docker info >/dev/null 2>&1; then
+                  break
+                fi
+                sleep 1
+              done
+
+              mkdir -p /root/.cache/huggingface
+
+              docker run -d --pull always --name vllm-container \
+                -v /root/.cache/huggingface:/root/.cache/huggingface \
+                -e HUGGING_FACE_HUB_TOKEN=${HFToken} \
+                -p 8000:8000 \
+                --ipc=host \
+                public.ecr.aws/q9t5s3a7/vllm-cpu-release-repo:v0.9.2 \
+                --model ${InferenceModel} >> /var/log/vllm-container.log 2>&1 &
+
+              docker ps -a >> /var/log/vllm-docker-status.log
+            - {
+                HFToken: !Ref HFToken,
+                InferenceModel: !Ref InferenceModel
+              }
+
+      Tags:
+        - Key: Name
+          Value: vllm-service
+
+Outputs:
+  InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref MyEC2Instance
+  InstancePublicIP:
+    Description: Public IP address of the instance
+    Value: !GetAtt MyEC2Instance.PublicIp
+  # VPCId:
+  #   Description: VPC ID used
+  #   Value: !Ref VpcId
