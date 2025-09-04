@@ -1,0 +1,163 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Production-ready CloudFormation template for deploying a vLLM inference service on AWS EC2.
+    This template provisions a secure, monitored EC2 instance running the mistralai/Mistral-7B-Instruct-v0.3
+    via vLLM container with auto-configured tensor/pipeline parallelism based on instance NUMA topology.
+
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "EC2 Configuration"
+        Parameters:
+          - KeyName
+          - SubnetId
+          - SecurityGroupId
+          - ImageId
+          - VolumeSize
+    ParameterLabels:
+      KeyName:
+        default: "EC2 Key Pair"
+      SubnetId:
+        default: "Subnet ID"
+      SecurityGroupId:
+        default: "Security Group ID"
+      ImageId:
+        default: "AMI ID"
+      InstanceType:
+        default: "EC2 Instance Type"
+      VolumeSize:
+        default: "Root Volume Size (GB)"
+
+Parameters:
+
+  KeyName:
+    Description: (Optional) Name of an existing EC2 KeyPair for SSH access
+    Type: String
+    Default: ""
+  
+  SubnetId:
+    Description: ID of an existing Subnet
+    Type: AWS::EC2::Subnet::Id
+
+  SecurityGroupId:
+    Description: ID of an existing Security Group
+    Type: AWS::EC2::SecurityGroup::Id
+
+  ImageId:
+    Description: AMI ID for the EC2 instance
+    Type: AWS::EC2::Image::Id
+
+  HFToken:
+    Type: String
+    NoEcho: true
+    Description: Hugging Face Hub Token
+
+  VolumeSize:
+    Description: Size of the root EBS volume in GB
+    Type: Number
+    Default: 128
+    MinValue: 64
+    MaxValue: 1024
+
+  InstanceType:
+    Description: > 
+      EC2 instance type for deploying the model inference service.
+      Default is r8i.24xlarge, recommended for optimal performance.
+      Selecting a lower-tier instance may result in reduced throughput or slower response times.
+    Type: String
+    AllowedValues:
+      - r8i.8xlarge
+      - r8i.12xlarge
+      - r8i.16xlarge
+      - r8i.24xlarge
+      - r8i.32xlarge
+      - r8i.48xlarge
+      - r8i.96xlarge
+      - r8i.metal-48xl
+      - r8i.metal-96xl
+      - r8i-flex.8xlarge
+      - r8i-flex.12xlarge
+      - r8i-flex.16xlarge
+    Default: r8i.24xlarge
+
+Conditions:
+  HasKeyName: !Not [!Equals [!Ref KeyName, ""]]
+
+Resources:
+  MyEC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref ImageId
+      KeyName: !If [HasKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          SubnetId: !Ref SubnetId
+          GroupSet:
+            - !Ref SecurityGroupId
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1 
+          Ebs:
+            VolumeSize: !Ref VolumeSize 
+            VolumeType: gp3
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64:
+          !Sub
+            - |
+              #!/bin/bash
+              set -e
+              mkdir -p /root/.cache/huggingface
+
+              # Get hardware info
+              total_sockets=$(lscpu | grep 'Socket(s):' | awk '{print $2}')
+              total_numa_nodes=$(lscpu | grep 'NUMA node(s):' | awk '{print $3}')
+
+              # Safety check for division
+              if [ "$total_sockets" -eq 0 ]; then
+                echo "Error: total_sockets is zero. Cannot divide." >> /var/log/vllm-error.log
+                exit 1
+              fi
+              
+              numa_nodes_per_socket=$((total_numa_nodes / total_sockets))
+
+              # Set parallelism flags based on NUMA nodes per socket
+              parallel_flag=""
+              if [ "$numa_nodes_per_socket" -eq 2 ] || [ "$numa_nodes_per_socket" -eq 4 ]; then
+                parallel_flag="--tensor-parallel-size $numa_nodes_per_socket"
+              elif [ "$numa_nodes_per_socket" -eq 3 ] || [ "$numa_nodes_per_socket" -eq 6 ]; then
+                parallel_flag="--pipeline-parallel-size $numa_nodes_per_socket"
+              fi
+
+              docker run -d --pull always --name vllm-container \
+                --restart unless-stopped \
+                -v /root/.cache/huggingface:/root/.cache/huggingface \
+                -e HUGGING_FACE_HUB_TOKEN=${HFToken} \
+                -p 8000:8000 \
+                --ipc=host \
+                public.ecr.aws/q9t5s3a7/vllm-cpu-release-repo:v0.10.1 \
+                --max-model-len 32768 \
+                --model mistralai/Mistral-7B-Instruct-v0.3 $parallel_flag >> /var/log/vllm-container.log 2>&1 &
+
+              docker ps -a >> /var/log/vllm-docker-status.log
+            - {
+                HFToken: !Ref HFToken
+              }
+
+      Tags:
+        - Key: Name
+          Value: mistral-model-serving
+
+Outputs:
+  InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref MyEC2Instance
+  InstancePublicIP:
+    Description: Public IP address of the instance
+    Value: !GetAtt MyEC2Instance.PublicIp
